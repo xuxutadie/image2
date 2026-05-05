@@ -1,0 +1,10 @@
+node_modules/
+app.db
+users.json
+ip_records.json
+*.log
+.env
+.env.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
