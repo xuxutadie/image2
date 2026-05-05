@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>新起点画室 - AI绘图工具</title>
+<script type="module" src="https://unpkg.com/@dotlottie/player-component@2.7.12/dist/dotlottie-player.mjs"></script>
 <style>
 /* CYBERPUNK THEME REFACTORED */
 :root {
@@ -297,6 +298,44 @@ body {
 }
 .center-empty-text {
   text-align: center; color: var(--text-dim); font-size: 13px; line-height: 1.6;
+}
+.center-generating {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  text-align: center;
+  padding: 24px;
+  z-index: 2;
+}
+.center-generating-player {
+  width: min(340px, 62vw);
+  max-width: 100%;
+  aspect-ratio: 1 / 1;
+  filter: drop-shadow(0 0 22px rgba(0, 229, 255, 0.18));
+}
+.center-generating-text {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-bright);
+  letter-spacing: 1px;
+}
+.center-generating-progress {
+  min-height: 44px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-dim);
+}
+.loading-action-btn {
+  margin-top: 15px;
+  padding: 6px 12px;
+  background: rgba(255,64,129,0.2);
+  color: #ff4081;
+  border: 1px solid #ff4081;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
 }
 .center-footer {
   text-align: center; padding: 12px; font-size: 12px; color: var(--text-dim);
@@ -657,6 +696,18 @@ body {
           AI 将为你创作精美的图像
         </div>
       </div>
+      <div id="centerGenerating" class="center-generating hidden" aria-live="polite">
+        <dotlottie-player
+          class="center-generating-player"
+          src="图标素材/Funny%20monsters.lottie"
+          background="transparent"
+          speed="1"
+          loop
+          autoplay
+        ></dotlottie-player>
+        <div class="center-generating-text">请耐心等待</div>
+        <div id="loadingProgress" class="center-generating-progress"></div>
+      </div>
       <img id="centerImage" class="hidden" alt="预览">
       <span id="centerIndex" class="hidden" style="position:absolute;top:10px;right:10px;color:var(--neon-cyan);background:rgba(0,0,0,0.5);padding:2px 8px;border-radius:4px;font-size:12px;"></span>
     </div>
@@ -816,14 +867,6 @@ body {
     </div>
   </div>
 </div>
-
-<!-- LOADING -->
-<div class="admin-overlay hidden" id="loadingOverlay" style="flex-direction:column;">
-  <div style="width:50px;height:50px;border:3px solid var(--border-dim);border-top-color:var(--neon-cyan);border-radius:50%;animation:spin 1s linear infinite;"></div>
-  <div style="color:var(--neon-cyan);margin-top:20px;font-weight:bold;">渲染中...</div>
-  <div id="loadingProgress" style="color:#fff;font-size:12px;margin-top:10px;"></div>
-</div>
-<style>@keyframes spin { 100% { transform: rotate(360deg); } }</style>
 
 <!-- TOAST -->
 <div id="toastContainer" style="position:fixed;bottom:20px;right:20px;z-index:9999;"></div>
@@ -1291,6 +1334,7 @@ function clearHistory() {
 function showInCenter(src, index) {
   const img = document.getElementById('centerImage');
   const empty = document.getElementById('centerEmpty');
+  const generating = document.getElementById('centerGenerating');
   const idx = document.getElementById('centerIndex');
   img.src = src;
   img.classList.remove('hidden');
@@ -1298,6 +1342,8 @@ function showInCenter(src, index) {
   img.onclick = () => openImageModal(src); // Add click to zoom
   empty.classList.add('hidden');
   empty.style.display = 'none';
+  generating.classList.add('hidden');
+  generating.style.display = 'none';
   idx.textContent = '#' + (index + 1);
   idx.classList.remove('hidden');
   idx.style.display = 'block';
@@ -1307,15 +1353,34 @@ function showInCenter(src, index) {
 function clearCenter() {
   const img = document.getElementById('centerImage');
   const empty = document.getElementById('centerEmpty');
+  const generating = document.getElementById('centerGenerating');
   const idx = document.getElementById('centerIndex');
   img.classList.add('hidden');
   img.style.display = 'none';
   img.onclick = null;
   empty.classList.remove('hidden');
   empty.style.display = 'block';
+  generating.classList.add('hidden');
+  generating.style.display = 'none';
   idx.classList.add('hidden');
   idx.style.display = 'none';
   STATE.selectedResultIndex = -1;
+}
+
+function showGeneratingState() {
+  const img = document.getElementById('centerImage');
+  const empty = document.getElementById('centerEmpty');
+  const generating = document.getElementById('centerGenerating');
+  const idx = document.getElementById('centerIndex');
+  img.classList.add('hidden');
+  img.style.display = 'none';
+  img.onclick = null;
+  empty.classList.add('hidden');
+  empty.style.display = 'none';
+  generating.classList.remove('hidden');
+  generating.style.display = 'flex';
+  idx.classList.add('hidden');
+  idx.style.display = 'none';
 }
 
 // Modal functions
@@ -1567,6 +1632,12 @@ function setupDragDrop() {
 // ===================== IMAGE GENERATION =====================
 let currentAbortController = null;
 
+function cancelGeneration() {
+  if (!STATE.isGenerating || !currentAbortController) return;
+  currentAbortController.abort();
+  showToast('已停止本次生成', 'success');
+}
+
 async function generateImages() {
   if (STATE.isGenerating) return;
 
@@ -1626,19 +1697,19 @@ async function generateImages() {
   STATE.isGenerating = true;
   STATE.results = [];
   document.getElementById('generateBtn').disabled = true;
-  document.getElementById('loadingOverlay').style.display = 'flex';
+  showGeneratingState();
 
   const startTime = Date.now();
   const sizeNote = STATE.quality === '4k' ? ' (4K可能需5-15分钟)' : '';
   const loadingProgress = document.getElementById('loadingProgress');
-  loadingProgress.innerHTML = (imageCount > 1 ? `正在生成 ${imageCount} 张...` : '正在生成...') + sizeNote + `<br><button onclick="cancelGeneration()" style="margin-top:15px;padding:6px 12px;background:rgba(255,64,129,0.2);color:#ff4081;border:1px solid #ff4081;border-radius:4px;cursor:pointer;font-size:12px;">停止生成 (不扣除积分)</button>`;
+  loadingProgress.innerHTML = (imageCount > 1 ? `正在生成 ${imageCount} 张...` : '正在生成...') + sizeNote + `<br><button onclick="cancelGeneration()" class="loading-action-btn">停止生成 (不扣除积分)</button>`;
 
   // 计时器
   let timerInterval = setInterval(() => {
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     const min = Math.floor(elapsed / 60);
     const sec = elapsed % 60;
-    loadingProgress.innerHTML = (imageCount > 1 ? `生成 ${imageCount} 张 | ` : '') + `${min}:${String(sec).padStart(2, '0')}` + sizeNote + `<br><button onclick="cancelGeneration()" style="margin-top:15px;padding:6px 12px;background:rgba(255,64,129,0.2);color:#ff4081;border:1px solid #ff4081;border-radius:4px;cursor:pointer;font-size:12px;">停止生成 (不扣除积分)</button>`;
+    loadingProgress.innerHTML = (imageCount > 1 ? `生成 ${imageCount} 张 | ` : '') + `${min}:${String(sec).padStart(2, '0')}` + sizeNote + `<br><button onclick="cancelGeneration()" class="loading-action-btn">停止生成 (不扣除积分)</button>`;
   }, 1000);
 
   currentAbortController = new AbortController();
@@ -1791,7 +1862,8 @@ async function generateImages() {
   clearInterval(timerInterval);
   STATE.isGenerating = false;
   document.getElementById('generateBtn').disabled = false;
-  document.getElementById('loadingOverlay').style.display = 'none';
+  document.getElementById('centerGenerating').classList.add('hidden');
+  document.getElementById('centerGenerating').style.display = 'none';
   document.getElementById('loadingProgress').textContent = '';
 }
 
