@@ -4,7 +4,7 @@
  * 1. 启动 MySQL 服务
  * 2. 可通过环境变量配置连接信息
  * 3. 执行: npm install && node server.js
- * 4. 浏览器打开: http://localhost:3456
+ * 4. 浏览器打开: http://localhost:8080
  */
 
 const http = require('http');
@@ -15,7 +15,7 @@ const { URL } = require('url');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 
-const PORT = 3456;
+const PORT = parseInt(process.env.PORT || '8080', 10);
 const LEGACY_USERS_FILE = path.join(__dirname, 'users.json');
 const LEGACY_IP_FILE = path.join(__dirname, 'ip_records.json');
 const QUALITY_COSTS = { '1k': 58, '2k': 98, '4k': 128 };
