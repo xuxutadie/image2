@@ -430,10 +430,23 @@ async function proxyMultipart(req, res) {
 
       let responded = false;
       let responseStarted = false;
+      
+      // 立即响应 200 OK，并设置分块传输
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Transfer-Encoding': 'chunked'
+      });
+      responseStarted = true;
+      
+      // 定期发送空白字符以保持连接活跃，防止 Zeabur 网关超时
+      const keepAliveInterval = setInterval(() => {
+        res.write(' ');
+      }, 15000);
+
       const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
         const respChunks = [];
-        res.writeHead(proxyRes.statusCode || 502, getForwardHeaders(proxyRes));
-        responseStarted = true;
         proxyRes.on('data', (chunk) => {
           respChunks.push(chunk);
           res.write(chunk);
@@ -441,6 +454,7 @@ async function proxyMultipart(req, res) {
         proxyRes.on('end', async () => {
           if (responded) return;
           responded = true;
+          clearInterval(keepAliveInterval);
           try {
             if (proxyRes.statusCode === 200) {
               const updatedUser = await updateUserPoints(
@@ -452,6 +466,9 @@ async function proxyMultipart(req, res) {
               if (updatedUser) {
                 console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
               }
+            } else {
+               // 如果上游返回非 200，记录错误
+               console.error(`[代理] multipart 上游返回状态码: ${proxyRes.statusCode}`);
             }
           } catch (error) {
             console.error('[扣费] 参考图生成后更新积分失败:', error);
@@ -463,26 +480,28 @@ async function proxyMultipart(req, res) {
         proxyRes.on('error', (err) => {
           if (responded) return;
           responded = true;
+          clearInterval(keepAliveInterval);
           console.error('[代理] multipart 上游响应错误:', err);
-          if (!responseStarted) {
-            sendJson(res, 502, { error: { message: `代理响应失败: ${err.message}` } });
-          } else {
-            res.destroy(err);
-          }
+          res.write(JSON.stringify({ error: { message: `代理响应失败: ${err.message}` } }));
+          res.end();
         });
       });
 
       proxyReq.on('error', (err) => {
         if (responded) return;
         responded = true;
-        sendJson(res, 502, { error: { message: `代理请求失败: ${err.message}` } });
+        clearInterval(keepAliveInterval);
+        res.write(JSON.stringify({ error: { message: `代理请求失败: ${err.message}` } }));
+        res.end();
       });
 
       proxyReq.on('timeout', () => {
         if (responded) return;
         responded = true;
+        clearInterval(keepAliveInterval);
         proxyReq.destroy();
-        sendJson(res, 504, { error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } });
+        res.write(JSON.stringify({ error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } }));
+        res.end();
       });
 
       proxyReq.write(rawBody);
@@ -550,15 +569,29 @@ function proxyJson(req, res) {
 
       let responded = false;
       let responseStarted = false;
+
+      // 立即响应 200 OK，并设置分块传输
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Transfer-Encoding': 'chunked'
+      });
+      responseStarted = true;
+      
+      // 定期发送空白字符以保持连接活跃，防止 Zeabur 网关超时
+      const keepAliveInterval = setInterval(() => {
+        res.write(' ');
+      }, 15000);
+
     const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 502, getForwardHeaders(proxyRes));
-        responseStarted = true;
         proxyRes.on('data', (chunk) => {
           res.write(chunk);
         });
       proxyRes.on('end', async () => {
         if (responded) return;
         responded = true;
+        clearInterval(keepAliveInterval);
           try {
             if (proxyRes.statusCode === 200) {
               const updatedUser = await updateUserPoints(
@@ -570,7 +603,9 @@ function proxyJson(req, res) {
               if (updatedUser) {
                 console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
               }
-          }
+            } else {
+              console.error(`[代理] json 上游返回状态码: ${proxyRes.statusCode}`);
+            }
           } catch (error) {
             console.error('[扣费] 普通生成后更新积分失败:', error);
           } finally {
@@ -581,26 +616,28 @@ function proxyJson(req, res) {
         proxyRes.on('error', (err) => {
           if (responded) return;
           responded = true;
+          clearInterval(keepAliveInterval);
           console.error('[代理] json 上游响应错误:', err);
-          if (!responseStarted) {
-            sendJson(res, 502, { error: { message: `代理响应失败: ${err.message}` } });
-          } else {
-            res.destroy(err);
-          }
+          res.write(JSON.stringify({ error: { message: `代理响应失败: ${err.message}` } }));
+          res.end();
       });
     });
 
     proxyReq.on('error', (err) => {
       if (responded) return;
       responded = true;
-      sendJson(res, 502, { error: { message: `代理请求失败: ${err.message}` } });
+      clearInterval(keepAliveInterval);
+      res.write(JSON.stringify({ error: { message: `代理请求失败: ${err.message}` } }));
+      res.end();
     });
 
     proxyReq.on('timeout', () => {
       if (responded) return;
       responded = true;
+      clearInterval(keepAliveInterval);
       proxyReq.destroy();
-      sendJson(res, 504, { error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } });
+      res.write(JSON.stringify({ error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } }));
+      res.end();
     });
 
     proxyReq.write(postData);

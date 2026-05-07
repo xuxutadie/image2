@@ -524,6 +524,32 @@ body {
 }
 .btn { padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; color: #fff; }
 .btn-primary { background: var(--neon-blue); }
+
+/* Toast */
+.toast {
+  background: var(--bg-card);
+  border: 1px solid var(--neon-blue);
+  color: var(--text-bright);
+  padding: 12px 20px;
+  border-radius: 8px;
+  margin-top: 10px;
+  box-shadow: var(--glow-blue);
+  font-size: 14px;
+  animation: slideIn 0.3s ease-out forwards;
+}
+.toast.error {
+  border-color: var(--neon-pink);
+  box-shadow: 0 0 15px rgba(255, 64, 129, 0.4);
+  color: #ff4081;
+}
+.toast.success {
+  border-color: var(--neon-cyan);
+  box-shadow: var(--glow-cyan);
+}
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
 </style>
 </head>
 <body>
