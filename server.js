@@ -20,6 +20,13 @@ const LEGACY_USERS_FILE = path.join(__dirname, 'users.json');
 const LEGACY_IP_FILE = path.join(__dirname, 'ip_records.json');
 const QUALITY_COSTS = { '1k': 58, '2k': 98, '4k': 128 };
 const BCRYPT_ROUNDS = 10;
+const DEFAULT_APP_SETTINGS = {
+  apiEndpoint: 'https://api.openai-hk.com/v1/images/generations',
+  apiKey: '',
+  model: 'gpt-image-2',
+  apiEnabled: false,
+  timerEnd: null,
+};
 
 const MYSQL_CONFIG = {
   host: process.env.MYSQL_HOST || '127.0.0.1',
@@ -108,7 +115,37 @@ async function initDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      setting_key VARCHAR(64) PRIMARY KEY,
+      setting_value TEXT NULL,
+      updated_at BIGINT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await ensureDefaultSettings();
+
   await migrateLegacyData();
+}
+
+async function ensureDefaultSettings() {
+  const now = Date.now();
+  const defaults = {
+    api_endpoint: DEFAULT_APP_SETTINGS.apiEndpoint,
+    api_key: DEFAULT_APP_SETTINGS.apiKey,
+    model: DEFAULT_APP_SETTINGS.model,
+    api_enabled: DEFAULT_APP_SETTINGS.apiEnabled ? '1' : '0',
+    timer_end: '',
+  };
+
+  for (const [key, value] of Object.entries(defaults)) {
+    await query(
+      `INSERT INTO app_settings (setting_key, setting_value, updated_at)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value, updated_at = updated_at`,
+      [key, String(value ?? ''), now]
+    );
+  }
 }
 
 async function migrateLegacyData() {
@@ -185,6 +222,62 @@ function normalizeUser(row) {
   };
 }
 
+async function getAppSettings() {
+  const rows = await query('SELECT setting_key, setting_value FROM app_settings');
+  const map = {};
+  for (const row of rows) {
+    map[row.setting_key] = row.setting_value;
+  }
+  let apiEnabled = map.api_enabled === '1';
+  let timerEnd = map.timer_end || null;
+
+  if (timerEnd && new Date(timerEnd) <= new Date()) {
+    apiEnabled = false;
+    timerEnd = null;
+    await query(
+      `UPDATE app_settings
+       SET setting_value = CASE
+         WHEN setting_key = 'api_enabled' THEN '0'
+         WHEN setting_key = 'timer_end' THEN ''
+         ELSE setting_value
+       END,
+       updated_at = ?
+       WHERE setting_key IN ('api_enabled', 'timer_end')`,
+      [Date.now()]
+    );
+  }
+
+  return {
+    apiEndpoint: map.api_endpoint || DEFAULT_APP_SETTINGS.apiEndpoint,
+    apiKey: map.api_key || DEFAULT_APP_SETTINGS.apiKey,
+    model: map.model || DEFAULT_APP_SETTINGS.model,
+    apiEnabled,
+    timerEnd,
+  };
+}
+
+async function saveAppSettings(nextSettings) {
+  const now = Date.now();
+  const entries = {
+    api_endpoint: nextSettings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint,
+    api_key: nextSettings.apiKey || '',
+    model: nextSettings.model || DEFAULT_APP_SETTINGS.model,
+    api_enabled: nextSettings.apiEnabled ? '1' : '0',
+    timer_end: nextSettings.timerEnd || '',
+  };
+
+  for (const [key, value] of Object.entries(entries)) {
+    await query(
+      `INSERT INTO app_settings (setting_key, setting_value, updated_at)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), updated_at = VALUES(updated_at)`,
+      [key, String(value), now]
+    );
+  }
+
+  return getAppSettings();
+}
+
 async function getUserById(userId) {
   return getOne('SELECT * FROM users WHERE id = ?', [userId]);
 }
@@ -234,6 +327,14 @@ function sendJson(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
+function getForwardHeaders(proxyRes) {
+  return {
+    'Content-Type': proxyRes.headers['content-type'] || 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store',
+  };
+}
+
 function serveFile(res, filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const mime = {
@@ -273,61 +374,74 @@ async function ensureUserCanAfford(userId, quality) {
   return { ok: true, user, cost };
 }
 
-function proxyRequest(req, res) {
+async function proxyRequest(req, res) {
   const contentType = req.headers['content-type'] || '';
   if (contentType.includes('multipart/form-data')) {
-    proxyMultipart(req, res);
+    await proxyMultipart(req, res);
   } else {
-    proxyJson(req, res);
+    await proxyJson(req, res);
   }
 }
 
-function proxyMultipart(req, res) {
-  const apiKey = req.headers['x-api-key'];
-  const endpoint = req.headers['x-api-endpoint'];
+async function proxyMultipart(req, res) {
   const reqContentType = req.headers['content-type'];
   const userId = req.headers['x-user-id'];
   const quality = req.headers['x-quality'] || '1k';
+  const settings = await getAppSettings();
+  const apiKey = settings.apiKey;
+  const endpoint = (settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint).replace(/\/generations\/?$/, '/edits');
 
-  if (!apiKey || !endpoint) {
-    sendJson(res, 400, { error: { message: '未提供API密钥或接口地址' } });
+  if (!settings.apiEnabled) {
+    sendJson(res, 503, { error: { message: 'API当前已禁用，请联系管理员' } });
     return;
   }
 
-  ensureUserCanAfford(userId, quality)
-    .then((authResult) => {
-      if (!authResult.ok) {
-        sendJson(res, authResult.status, authResult.body);
-        return;
-      }
+  if (!apiKey || !endpoint) {
+    sendJson(res, 503, { error: { message: '管理员尚未配置可用的API，请联系管理员' } });
+    return;
+  }
 
-      const chunks = [];
-      req.on('data', (chunk) => chunks.push(chunk));
-      req.on('end', () => {
-        const rawBody = Buffer.concat(chunks);
-        const targetUrl = new URL(endpoint);
-        const isHttps = targetUrl.protocol === 'https:';
-        const options = {
-          hostname: targetUrl.hostname,
-          port: targetUrl.port || (isHttps ? 443 : 80),
-          path: targetUrl.pathname + targetUrl.search,
-          method: 'POST',
-          headers: {
-            'Content-Type': reqContentType,
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Length': rawBody.length,
-          },
-          timeout: 3600000,
-          rejectUnauthorized: false,
-        };
+  const authResult = await ensureUserCanAfford(userId, quality);
+  if (!authResult.ok) {
+    sendJson(res, authResult.status, authResult.body);
+    return;
+  }
 
-        let responded = false;
-        const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
-          const respChunks = [];
-          proxyRes.on('data', (chunk) => respChunks.push(chunk));
-          proxyRes.on('end', async () => {
-            if (responded) return;
-            responded = true;
+  try {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks);
+      const targetUrl = new URL(endpoint);
+      const isHttps = targetUrl.protocol === 'https:';
+      const options = {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || (isHttps ? 443 : 80),
+        path: targetUrl.pathname + targetUrl.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': reqContentType,
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Length': rawBody.length,
+        },
+        timeout: 3600000,
+        rejectUnauthorized: false,
+      };
+
+      let responded = false;
+      let responseStarted = false;
+      const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
+        const respChunks = [];
+        res.writeHead(proxyRes.statusCode || 502, getForwardHeaders(proxyRes));
+        responseStarted = true;
+        proxyRes.on('data', (chunk) => {
+          respChunks.push(chunk);
+          res.write(chunk);
+        });
+        proxyRes.on('end', async () => {
+          if (responded) return;
+          responded = true;
+          try {
             if (proxyRes.statusCode === 200) {
               const updatedUser = await updateUserPoints(
                 authResult.user.id,
@@ -339,35 +453,45 @@ function proxyMultipart(req, res) {
                 console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
               }
             }
-            res.writeHead(proxyRes.statusCode, {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-            });
-            res.end(Buffer.concat(respChunks));
-          });
+          } catch (error) {
+            console.error('[扣费] 参考图生成后更新积分失败:', error);
+          } finally {
+            res.end();
+          }
         });
 
-        proxyReq.on('error', (err) => {
+        proxyRes.on('error', (err) => {
           if (responded) return;
           responded = true;
-          sendJson(res, 502, { error: { message: `代理请求失败: ${err.message}` } });
+          console.error('[代理] multipart 上游响应错误:', err);
+          if (!responseStarted) {
+            sendJson(res, 502, { error: { message: `代理响应失败: ${err.message}` } });
+          } else {
+            res.destroy(err);
+          }
         });
-
-        proxyReq.on('timeout', () => {
-          if (responded) return;
-          responded = true;
-          proxyReq.destroy();
-          sendJson(res, 504, { error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } });
-        });
-
-        proxyReq.write(rawBody);
-        proxyReq.end();
       });
-    })
-    .catch((error) => {
-      console.error('[代理] multipart 错误:', error);
-      sendJson(res, 500, { error: { message: '服务器内部错误' } });
+
+      proxyReq.on('error', (err) => {
+        if (responded) return;
+        responded = true;
+        sendJson(res, 502, { error: { message: `代理请求失败: ${err.message}` } });
+      });
+
+      proxyReq.on('timeout', () => {
+        if (responded) return;
+        responded = true;
+        proxyReq.destroy();
+        sendJson(res, 504, { error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } });
+      });
+
+      proxyReq.write(rawBody);
+      proxyReq.end();
     });
+  } catch (error) {
+    console.error('[代理] multipart 错误:', error);
+    sendJson(res, 500, { error: { message: '服务器内部错误' } });
+  }
 }
 
 function proxyJson(req, res) {
@@ -382,15 +506,21 @@ function proxyJson(req, res) {
       return;
     }
 
-    const { apiKey, endpoint } = params;
+    const settings = await getAppSettings();
+    const apiKey = settings.apiKey;
+    const endpoint = settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint;
+    if (!settings.apiEnabled) {
+      sendJson(res, 503, { error: { message: 'API当前已禁用，请联系管理员' } });
+      return;
+    }
     if (!apiKey || !endpoint) {
-      sendJson(res, 400, { error: { message: '未提供API密钥或接口地址' } });
+      sendJson(res, 503, { error: { message: '管理员尚未配置可用的API，请联系管理员' } });
       return;
     }
 
     const apiBody = {};
     for (const key of Object.keys(params)) {
-      if (key !== 'apiKey' && key !== 'endpoint') apiBody[key] = params[key];
+      apiBody[key] = params[key];
     }
 
     const userId = req.headers['x-user-id'];
@@ -418,29 +548,45 @@ function proxyJson(req, res) {
       rejectUnauthorized: false,
     };
 
-    let responded = false;
+      let responded = false;
+      let responseStarted = false;
     const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
-      let responseBody = '';
-      proxyRes.on('data', (chunk) => { responseBody += chunk; });
+        res.writeHead(proxyRes.statusCode || 502, getForwardHeaders(proxyRes));
+        responseStarted = true;
+        proxyRes.on('data', (chunk) => {
+          res.write(chunk);
+        });
       proxyRes.on('end', async () => {
         if (responded) return;
         responded = true;
-        if (proxyRes.statusCode === 200) {
-          const updatedUser = await updateUserPoints(
-            authResult.user.id,
-            -authResult.cost,
-            'generate',
-            `普通生成(${quality})`
-          );
-          if (updatedUser) {
-            console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
+          try {
+            if (proxyRes.statusCode === 200) {
+              const updatedUser = await updateUserPoints(
+                authResult.user.id,
+                -authResult.cost,
+                'generate',
+                `普通生成(${quality})`
+              );
+              if (updatedUser) {
+                console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
+              }
           }
+          } catch (error) {
+            console.error('[扣费] 普通生成后更新积分失败:', error);
+          } finally {
+            res.end();
         }
-        res.writeHead(proxyRes.statusCode, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
         });
-        res.end(responseBody);
+
+        proxyRes.on('error', (err) => {
+          if (responded) return;
+          responded = true;
+          console.error('[代理] json 上游响应错误:', err);
+          if (!responseStarted) {
+            sendJson(res, 502, { error: { message: `代理响应失败: ${err.message}` } });
+          } else {
+            res.destroy(err);
+          }
       });
     });
 
@@ -576,6 +722,27 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/api/settings/public') {
+      const settings = await getAppSettings();
+      sendJson(res, 200, {
+        success: true,
+        settings: {
+          apiEndpoint: settings.apiEndpoint,
+          model: settings.model,
+          apiEnabled: settings.apiEnabled,
+          timerEnd: settings.timerEnd,
+          apiConfigured: !!settings.apiKey,
+        },
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/settings') {
+      const settings = await getAppSettings();
+      sendJson(res, 200, { success: true, settings });
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/api/recharge') {
       const { userId, points } = await parseRequestBody(req);
       const delta = parseInt(points, 10);
@@ -611,6 +778,31 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, { success: true, user: normalizeUser(updatedUser) });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/settings') {
+      const data = await parseRequestBody(req);
+      const apiEndpoint = (data.apiEndpoint || '').trim();
+      const apiKey = (data.apiKey || '').trim();
+      const model = (data.model || DEFAULT_APP_SETTINGS.model).trim();
+      const apiEnabled = data.apiEnabled === true;
+      const timerEnd = data.timerEnd ? String(data.timerEnd) : null;
+
+      if (!apiEndpoint) {
+        sendJson(res, 400, { error: 'API接口地址不能为空' });
+        return;
+      }
+
+      const settings = await saveAppSettings({
+        apiEndpoint,
+        apiKey,
+        model,
+        apiEnabled: apiEnabled && !!apiKey,
+        timerEnd: apiEnabled && !!apiKey ? timerEnd : null,
+      });
+
+      sendJson(res, 200, { success: true, settings });
       return;
     }
 
@@ -653,6 +845,10 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 500, { error: '服务器内部错误' });
   }
 });
+
+// 2K/4K 出图耗时较长，关闭默认请求超时，避免连接被服务端提前断开。
+server.requestTimeout = 0;
+server.timeout = 0;
 
 initDatabase()
   .then(() => {
