@@ -18,8 +18,10 @@ const bcrypt = require('bcryptjs');
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const LEGACY_USERS_FILE = path.join(__dirname, 'users.json');
 const LEGACY_IP_FILE = path.join(__dirname, 'ip_records.json');
+const JSON_SETTINGS_FILE = path.join(__dirname, 'app_settings.json');
 const QUALITY_COSTS = { '1k': 58, '2k': 98, '4k': 128 };
 const BCRYPT_ROUNDS = 10;
+const GENERATION_JOB_TTL_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_APP_SETTINGS = {
   apiEndpoint: 'https://api.openai-hk.com/v1/images/generations',
   apiKey: '',
@@ -38,6 +40,11 @@ const MYSQL_CONFIG = {
 };
 
 let pool = null;
+let useJsonStore = false;
+let jsonUsers = {};
+let jsonIpRegistrations = {};
+let jsonAppSettings = {};
+const generationJobs = new Map();
 
 async function query(sql, params = []) {
   const [rows] = await pool.execute(sql, params);
@@ -49,86 +56,168 @@ async function getOne(sql, params = []) {
   return rows[0] || null;
 }
 
+function readJsonFile(filePath, fallback) {
+  if (!fs.existsSync(filePath)) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    console.error(`[JSON] 读取 ${path.basename(filePath)} 失败:`, error.message);
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+async function loadJsonStore() {
+  const rawUsers = readJsonFile(LEGACY_USERS_FILE, {});
+  const normalizedUsers = {};
+
+  for (const user of Object.values(rawUsers)) {
+    if (!user || !user.id || !user.username) continue;
+
+    let passwordHash = user.password_hash || null;
+    if (!passwordHash && user.password) {
+      passwordHash = await bcrypt.hash(String(user.password), BCRYPT_ROUNDS);
+    }
+
+    const registeredAt = parseInt(user.registered_at || user.registeredAt || Date.now(), 10);
+    normalizedUsers[user.id] = {
+      id: user.id,
+      username: user.username,
+      real_name: user.real_name || user.realName || null,
+      password_hash: passwordHash,
+      points: parseInt(user.points || 0, 10),
+      registered_at: registeredAt,
+      register_ip: user.register_ip || user.registerIp || null,
+      open_id: user.open_id || user.openId || null,
+      created_at: parseInt(user.created_at || registeredAt, 10),
+      updated_at: parseInt(user.updated_at || Date.now(), 10),
+    };
+  }
+
+  jsonUsers = normalizedUsers;
+  jsonIpRegistrations = readJsonFile(LEGACY_IP_FILE, {});
+  jsonAppSettings = readJsonFile(JSON_SETTINGS_FILE, {});
+}
+
+function persistJsonUsers() {
+  writeJsonFile(LEGACY_USERS_FILE, jsonUsers);
+}
+
+function persistJsonIpRegistrations() {
+  writeJsonFile(LEGACY_IP_FILE, jsonIpRegistrations);
+}
+
+function persistJsonSettings() {
+  writeJsonFile(JSON_SETTINGS_FILE, jsonAppSettings);
+}
+
 async function initDatabase() {
-  const bootstrap = await mysql.createConnection({
-    host: MYSQL_CONFIG.host,
-    port: MYSQL_CONFIG.port,
-    user: MYSQL_CONFIG.user,
-    password: MYSQL_CONFIG.password,
-    charset: MYSQL_CONFIG.charset,
-    multipleStatements: true,
-  });
+  try {
+    const bootstrap = await mysql.createConnection({
+      host: MYSQL_CONFIG.host,
+      port: MYSQL_CONFIG.port,
+      user: MYSQL_CONFIG.user,
+      password: MYSQL_CONFIG.password,
+      charset: MYSQL_CONFIG.charset,
+      multipleStatements: true,
+    });
 
-  await bootstrap.query(
-    `CREATE DATABASE IF NOT EXISTS \`${MYSQL_CONFIG.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
-  );
-  await bootstrap.end();
+    await bootstrap.query(
+      `CREATE DATABASE IF NOT EXISTS \`${MYSQL_CONFIG.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+    );
+    await bootstrap.end();
 
-  pool = mysql.createPool({
-    host: MYSQL_CONFIG.host,
-    port: MYSQL_CONFIG.port,
-    user: MYSQL_CONFIG.user,
-    password: MYSQL_CONFIG.password,
-    database: MYSQL_CONFIG.database,
-    charset: MYSQL_CONFIG.charset,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-  });
+    pool = mysql.createPool({
+      host: MYSQL_CONFIG.host,
+      port: MYSQL_CONFIG.port,
+      user: MYSQL_CONFIG.user,
+      password: MYSQL_CONFIG.password,
+      database: MYSQL_CONFIG.database,
+      charset: MYSQL_CONFIG.charset,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+    });
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id VARCHAR(64) PRIMARY KEY,
-      username VARCHAR(255) NOT NULL UNIQUE,
-      real_name VARCHAR(255) NULL,
-      password_hash VARCHAR(255) NULL,
-      points INT NOT NULL DEFAULT 0,
-      registered_at BIGINT NOT NULL,
-      register_ip VARCHAR(64) NULL,
-      open_id VARCHAR(255) NULL,
-      created_at BIGINT NOT NULL,
-      updated_at BIGINT NOT NULL,
-      INDEX idx_users_registered_at (registered_at),
-      INDEX idx_users_register_ip (register_ip)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(64) PRIMARY KEY,
+        username VARCHAR(255) NOT NULL UNIQUE,
+        real_name VARCHAR(255) NULL,
+        password_hash VARCHAR(255) NULL,
+        points INT NOT NULL DEFAULT 0,
+        registered_at BIGINT NOT NULL,
+        register_ip VARCHAR(64) NULL,
+        open_id VARCHAR(255) NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_users_registered_at (registered_at),
+        INDEX idx_users_register_ip (register_ip)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS ip_registrations (
-      ip VARCHAR(64) PRIMARY KEY,
-      last_registered_at BIGINT NOT NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
+    await query(`
+      CREATE TABLE IF NOT EXISTS ip_registrations (
+        ip VARCHAR(64) PRIMARY KEY,
+        last_registered_at BIGINT NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS point_logs (
-      id BIGINT PRIMARY KEY AUTO_INCREMENT,
-      user_id VARCHAR(64) NOT NULL,
-      change_amount INT NOT NULL,
-      balance_after INT NOT NULL,
-      action VARCHAR(64) NOT NULL,
-      note VARCHAR(255) NULL,
-      created_at BIGINT NOT NULL,
-      INDEX idx_point_logs_user_id (user_id),
-      INDEX idx_point_logs_created_at (created_at),
-      CONSTRAINT fk_point_logs_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
+    await query(`
+      CREATE TABLE IF NOT EXISTS point_logs (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        user_id VARCHAR(64) NOT NULL,
+        change_amount INT NOT NULL,
+        balance_after INT NOT NULL,
+        action VARCHAR(64) NOT NULL,
+        note VARCHAR(255) NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_point_logs_user_id (user_id),
+        INDEX idx_point_logs_created_at (created_at),
+        CONSTRAINT fk_point_logs_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS app_settings (
-      setting_key VARCHAR(64) PRIMARY KEY,
-      setting_value TEXT NULL,
-      updated_at BIGINT NOT NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
+    await query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        setting_key VARCHAR(64) PRIMARY KEY,
+        setting_value TEXT NULL,
+        updated_at BIGINT NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
 
-  await ensureDefaultSettings();
-
-  await migrateLegacyData();
+    await ensureDefaultSettings();
+    await migrateLegacyData();
+  } catch (error) {
+    useJsonStore = true;
+    pool = null;
+    await loadJsonStore();
+    await ensureDefaultSettings();
+    console.warn(`[启动] MySQL 不可用，已切换到 JSON 本地模式: ${error.message}`);
+  }
 }
 
 async function ensureDefaultSettings() {
+  if (useJsonStore) {
+    jsonAppSettings = {
+      api_endpoint: jsonAppSettings.api_endpoint || DEFAULT_APP_SETTINGS.apiEndpoint,
+      api_key: jsonAppSettings.api_key || DEFAULT_APP_SETTINGS.apiKey,
+      model: jsonAppSettings.model || DEFAULT_APP_SETTINGS.model,
+      api_enabled: Object.prototype.hasOwnProperty.call(jsonAppSettings, 'api_enabled')
+        ? jsonAppSettings.api_enabled
+        : (DEFAULT_APP_SETTINGS.apiEnabled ? '1' : '0'),
+      timer_end: jsonAppSettings.timer_end || '',
+    };
+    persistJsonSettings();
+    return;
+  }
+
   const now = Date.now();
   const defaults = {
     api_endpoint: DEFAULT_APP_SETTINGS.apiEndpoint,
@@ -223,6 +312,27 @@ function normalizeUser(row) {
 }
 
 async function getAppSettings() {
+  if (useJsonStore) {
+    let apiEnabled = jsonAppSettings.api_enabled === '1';
+    let timerEnd = jsonAppSettings.timer_end || null;
+
+    if (timerEnd && new Date(timerEnd) <= new Date()) {
+      apiEnabled = false;
+      timerEnd = null;
+      jsonAppSettings.api_enabled = '0';
+      jsonAppSettings.timer_end = '';
+      persistJsonSettings();
+    }
+
+    return {
+      apiEndpoint: jsonAppSettings.api_endpoint || DEFAULT_APP_SETTINGS.apiEndpoint,
+      apiKey: jsonAppSettings.api_key || DEFAULT_APP_SETTINGS.apiKey,
+      model: jsonAppSettings.model || DEFAULT_APP_SETTINGS.model,
+      apiEnabled,
+      timerEnd,
+    };
+  }
+
   const rows = await query('SELECT setting_key, setting_value FROM app_settings');
   const map = {};
   for (const row of rows) {
@@ -257,6 +367,16 @@ async function getAppSettings() {
 }
 
 async function saveAppSettings(nextSettings) {
+  if (useJsonStore) {
+    jsonAppSettings.api_endpoint = nextSettings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint;
+    jsonAppSettings.api_key = nextSettings.apiKey || '';
+    jsonAppSettings.model = nextSettings.model || DEFAULT_APP_SETTINGS.model;
+    jsonAppSettings.api_enabled = nextSettings.apiEnabled ? '1' : '0';
+    jsonAppSettings.timer_end = nextSettings.timerEnd || '';
+    persistJsonSettings();
+    return getAppSettings();
+  }
+
   const now = Date.now();
   const entries = {
     api_endpoint: nextSettings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint,
@@ -279,14 +399,38 @@ async function saveAppSettings(nextSettings) {
 }
 
 async function getUserById(userId) {
+  if (useJsonStore) {
+    return jsonUsers[userId] || null;
+  }
   return getOne('SELECT * FROM users WHERE id = ?', [userId]);
 }
 
 async function getUserByUsername(username) {
+  if (useJsonStore) {
+    return Object.values(jsonUsers).find((user) => user.username === username) || null;
+  }
   return getOne('SELECT * FROM users WHERE username = ?', [username]);
 }
 
 async function updateUserPoints(userId, delta, action, note) {
+  if (useJsonStore) {
+    const user = jsonUsers[userId];
+    if (!user) {
+      return null;
+    }
+
+    const nextPoints = user.points + delta;
+    if (nextPoints < 0) {
+      return null;
+    }
+
+    user.points = nextPoints;
+    user.updated_at = Date.now();
+    jsonUsers[userId] = user;
+    persistJsonUsers();
+    return { ...user };
+  }
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -374,31 +518,267 @@ async function ensureUserCanAfford(userId, quality) {
   return { ok: true, user, cost };
 }
 
-async function proxyRequest(req, res) {
-  const contentType = req.headers['content-type'] || '';
-  if (contentType.includes('multipart/form-data')) {
-    await proxyMultipart(req, res);
-  } else {
-    await proxyJson(req, res);
+function createJobId() {
+  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cleanupExpiredJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of generationJobs.entries()) {
+    if (now - job.updatedAt > GENERATION_JOB_TTL_MS) {
+      generationJobs.delete(jobId);
+    }
   }
 }
 
-async function proxyMultipart(req, res) {
-  const reqContentType = req.headers['content-type'];
+function parseApiImages(rawText) {
+  const parsedImages = [];
+
+  try {
+    const data = JSON.parse(rawText);
+    if (data.data && Array.isArray(data.data)) {
+      data.data.forEach((item, index) => {
+        if (item && (item.url || item.b64_json)) {
+          parsedImages.push({
+            url: item.url || null,
+            b64: item.b64_json || null,
+            index,
+          });
+        }
+      });
+      if (parsedImages.length > 0) {
+        return parsedImages;
+      }
+    }
+  } catch (error) {
+    // Ignore and continue with NDJSON parsing.
+  }
+
+  const partialParts = {};
+  const lines = rawText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === 'image_generation.completed' && obj.b64_json) {
+        parsedImages.push({ url: null, b64: obj.b64_json, index: parsedImages.length });
+      } else if (obj.type === 'image_generation.partial_image' && obj.b64_json) {
+        const idx = obj.partial_image_index || 0;
+        if (!partialParts[idx]) partialParts[idx] = [];
+        partialParts[idx].push(obj.b64_json);
+      } else if (obj.b64_json && !obj.type) {
+        parsedImages.push({ url: null, b64: obj.b64_json, index: parsedImages.length });
+      } else if (obj.data && Array.isArray(obj.data)) {
+        obj.data.forEach((item) => {
+          if (item && (item.url || item.b64_json)) {
+            parsedImages.push({
+              url: item.url || null,
+              b64: item.b64_json || null,
+              index: parsedImages.length,
+            });
+          }
+        });
+      }
+    } catch (error) {
+      // Ignore malformed non-JSON lines.
+    }
+  }
+
+  for (const idx of Object.keys(partialParts).sort((a, b) => Number(a) - Number(b))) {
+    parsedImages.push({
+      url: null,
+      b64: partialParts[idx].join(''),
+      index: Number(idx),
+    });
+  }
+
+  return parsedImages;
+}
+
+function parseApiErrorMessage(rawText, statusCode) {
+  try {
+    const data = JSON.parse(rawText);
+    return data.error?.message || data.message || `HTTP ${statusCode}`;
+  } catch (error) {
+    const firstLine = rawText.split('\n').map((line) => line.trim()).find(Boolean);
+    return firstLine || `HTTP ${statusCode}`;
+  }
+}
+
+function parseRawRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function requestUpstream(targetUrl, headers, body, job) {
+  return new Promise((resolve, reject) => {
+    const isHttps = targetUrl.protocol === 'https:';
+    const options = {
+      protocol: targetUrl.protocol,
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (isHttps ? 443 : 80),
+      path: targetUrl.pathname + targetUrl.search,
+      method: 'POST',
+      headers,
+      timeout: 3600000,
+      rejectUnauthorized: false,
+    };
+
+    const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
+      const chunks = [];
+      proxyRes.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      proxyRes.on('end', () => {
+        resolve({
+          statusCode: proxyRes.statusCode || 502,
+          bodyText: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+      proxyRes.on('error', reject);
+    });
+
+    proxyReq.on('error', (err) => {
+      if (job.cancelRequested) {
+        reject(new Error('GENERATION_CANCELLED'));
+        return;
+      }
+      reject(err);
+    });
+
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy(new Error('UPSTREAM_TIMEOUT'));
+    });
+
+    job.activeRequest = proxyReq;
+    proxyReq.write(body);
+    proxyReq.end();
+  });
+}
+
+async function runGenerationJob(job) {
+  if (job.status === 'cancelled') {
+    return;
+  }
+
+  job.status = 'processing';
+  job.startedAt = Date.now();
+  job.updatedAt = job.startedAt;
+
+  try {
+    const upstream = await requestUpstream(job.targetUrl, job.headers, job.body, job);
+
+    if (job.cancelRequested || job.status === 'cancelled') {
+      job.status = 'cancelled';
+      job.updatedAt = Date.now();
+      return;
+    }
+
+    if (upstream.statusCode !== 200) {
+      job.status = 'failed';
+      job.errorMessage = parseApiErrorMessage(upstream.bodyText, upstream.statusCode);
+      job.updatedAt = Date.now();
+      console.error(`[生成任务] 上游返回失败 ${upstream.statusCode}: ${job.errorMessage}`);
+      return;
+    }
+
+    const images = parseApiImages(upstream.bodyText);
+    if (!images.length) {
+      job.status = 'failed';
+      job.errorMessage = 'API未返回图片';
+      job.updatedAt = Date.now();
+      return;
+    }
+
+    const actionLabel = job.type === 'multipart' ? `参考图生成(${job.quality})` : `普通生成(${job.quality})`;
+    const updatedUser = await updateUserPoints(job.user.id, -job.cost, 'generate', actionLabel);
+    if (!updatedUser) {
+      job.status = 'failed';
+      job.errorMessage = '积分扣减失败，请检查是否有并发生成任务';
+      job.updatedAt = Date.now();
+      return;
+    }
+
+    job.status = 'completed';
+    job.completedAt = Date.now();
+    job.updatedAt = job.completedAt;
+    job.result = {
+      images,
+      user: normalizeUser(updatedUser),
+    };
+    console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${job.cost} 积分，剩余 ${updatedUser.points}`);
+  } catch (error) {
+    if (job.cancelRequested || error.message === 'GENERATION_CANCELLED') {
+      job.status = 'cancelled';
+      job.updatedAt = Date.now();
+      return;
+    }
+
+    job.status = 'failed';
+    job.errorMessage = error.message === 'UPSTREAM_TIMEOUT'
+      ? 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试'
+      : `代理请求失败: ${error.message}`;
+    job.updatedAt = Date.now();
+    console.error('[生成任务] 执行失败:', error);
+  } finally {
+    job.activeRequest = null;
+  }
+}
+
+async function createGenerationJob(req, res) {
+  cleanupExpiredJobs();
+
+  const contentType = req.headers['content-type'] || '';
   const userId = req.headers['x-user-id'];
-  const quality = req.headers['x-quality'] || '1k';
+  const requestedQuality = req.headers['x-quality'] || '1k';
   const settings = await getAppSettings();
-  const apiKey = settings.apiKey;
-  const endpoint = (settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint).replace(/\/generations\/?$/, '/edits');
 
   if (!settings.apiEnabled) {
     sendJson(res, 503, { error: { message: 'API当前已禁用，请联系管理员' } });
     return;
   }
 
-  if (!apiKey || !endpoint) {
+  if (!settings.apiKey || !settings.apiEndpoint) {
     sendJson(res, 503, { error: { message: '管理员尚未配置可用的API，请联系管理员' } });
     return;
+  }
+
+  const rawBody = await parseRawRequestBody(req);
+  let quality = requestedQuality;
+  let type = 'json';
+  let targetUrl = new URL(settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint);
+  let headers = {};
+
+  if (contentType.includes('multipart/form-data')) {
+    type = 'multipart';
+    targetUrl = new URL((settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint).replace(/\/generations\/?$/, '/edits'));
+    headers = {
+      'Content-Type': contentType,
+      Authorization: `Bearer ${settings.apiKey}`,
+      'Content-Length': rawBody.length,
+    };
+  } else {
+    let params;
+    try {
+      params = JSON.parse(rawBody.toString('utf8') || '{}');
+    } catch (error) {
+      sendJson(res, 400, { error: { message: '请求数据格式错误' } });
+      return;
+    }
+
+    quality = params.quality || requestedQuality;
+    headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${settings.apiKey}`,
+      'Content-Length': rawBody.length,
+    };
   }
 
   const authResult = await ensureUserCanAfford(userId, quality);
@@ -407,242 +787,102 @@ async function proxyMultipart(req, res) {
     return;
   }
 
-  try {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => {
-      const rawBody = Buffer.concat(chunks);
-      const targetUrl = new URL(endpoint);
-      const isHttps = targetUrl.protocol === 'https:';
-      const options = {
-        hostname: targetUrl.hostname,
-        port: targetUrl.port || (isHttps ? 443 : 80),
-        path: targetUrl.pathname + targetUrl.search,
-        method: 'POST',
-        headers: {
-          'Content-Type': reqContentType,
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Length': rawBody.length,
-        },
-        timeout: 3600000,
-        rejectUnauthorized: false,
-      };
+  const cost = QUALITY_COSTS[quality] || QUALITY_COSTS['1k'];
+  const jobId = createJobId();
+  const job = {
+    id: jobId,
+    userId,
+    user: authResult.user,
+    cost,
+    quality,
+    type,
+    status: 'queued',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    startedAt: null,
+    completedAt: null,
+    targetUrl,
+    headers,
+    body: rawBody,
+    activeRequest: null,
+    cancelRequested: false,
+    errorMessage: '',
+    result: null,
+  };
 
-      let responded = false;
-      let responseStarted = false;
-      
-      // 立即响应 200 OK，并设置分块传输
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store',
-        'Transfer-Encoding': 'chunked'
-      });
-      responseStarted = true;
-      
-      // 定期发送空白字符以保持连接活跃，防止 Zeabur 网关超时
-      const keepAliveInterval = setInterval(() => {
-        res.write(' ');
-      }, 15000);
+  generationJobs.set(jobId, job);
+  runGenerationJob(job).catch((error) => {
+    job.status = 'failed';
+    job.errorMessage = error.message || '生成任务执行失败';
+    job.updatedAt = Date.now();
+  });
 
-      const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
-        const respChunks = [];
-        proxyRes.on('data', (chunk) => {
-          respChunks.push(chunk);
-          res.write(chunk);
-        });
-        proxyRes.on('end', async () => {
-          if (responded) return;
-          responded = true;
-          clearInterval(keepAliveInterval);
-          try {
-            if (proxyRes.statusCode === 200) {
-              const updatedUser = await updateUserPoints(
-                authResult.user.id,
-                -authResult.cost,
-                'generate',
-                `参考图生成(${quality})`
-              );
-              if (updatedUser) {
-                console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
-              }
-            } else {
-               // 如果上游返回非 200，记录错误
-               console.error(`[代理] multipart 上游返回状态码: ${proxyRes.statusCode}`);
-            }
-          } catch (error) {
-            console.error('[扣费] 参考图生成后更新积分失败:', error);
-          } finally {
-            res.end();
-          }
-        });
-
-        proxyRes.on('error', (err) => {
-          if (responded) return;
-          responded = true;
-          clearInterval(keepAliveInterval);
-          console.error('[代理] multipart 上游响应错误:', err);
-          res.write(JSON.stringify({ error: { message: `代理响应失败: ${err.message}` } }));
-          res.end();
-        });
-      });
-
-      proxyReq.on('error', (err) => {
-        if (responded) return;
-        responded = true;
-        clearInterval(keepAliveInterval);
-        res.write(JSON.stringify({ error: { message: `代理请求失败: ${err.message}` } }));
-        res.end();
-      });
-
-      proxyReq.on('timeout', () => {
-        if (responded) return;
-        responded = true;
-        clearInterval(keepAliveInterval);
-        proxyReq.destroy();
-        res.write(JSON.stringify({ error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } }));
-        res.end();
-      });
-
-      proxyReq.write(rawBody);
-      proxyReq.end();
-    });
-  } catch (error) {
-    console.error('[代理] multipart 错误:', error);
-    sendJson(res, 500, { error: { message: '服务器内部错误' } });
-  }
+  sendJson(res, 202, {
+    success: true,
+    jobId,
+    status: job.status,
+  });
 }
 
-function proxyJson(req, res) {
-  let body = '';
-  req.on('data', (chunk) => { body += chunk; });
-  req.on('end', async () => {
-    let params;
-    try {
-      params = JSON.parse(body || '{}');
-    } catch (error) {
-      sendJson(res, 400, { error: { message: '请求数据格式错误' } });
-      return;
-    }
+function getGenerationJob(req, res, url) {
+  cleanupExpiredJobs();
+  const jobId = url.searchParams.get('id');
+  const requesterId = req.headers['x-user-id'];
+  const job = jobId ? generationJobs.get(jobId) : null;
 
-    const settings = await getAppSettings();
-    const apiKey = settings.apiKey;
-    const endpoint = settings.apiEndpoint || DEFAULT_APP_SETTINGS.apiEndpoint;
-    if (!settings.apiEnabled) {
-      sendJson(res, 503, { error: { message: 'API当前已禁用，请联系管理员' } });
-      return;
-    }
-    if (!apiKey || !endpoint) {
-      sendJson(res, 503, { error: { message: '管理员尚未配置可用的API，请联系管理员' } });
-      return;
-    }
+  if (!job) {
+    sendJson(res, 404, { error: '生成任务不存在或已过期' });
+    return;
+  }
 
-    const apiBody = {};
-    for (const key of Object.keys(params)) {
-      apiBody[key] = params[key];
-    }
+  if (requesterId && requesterId !== job.userId) {
+    sendJson(res, 403, { error: '无权查看该生成任务' });
+    return;
+  }
 
-    const userId = req.headers['x-user-id'];
-    const quality = apiBody.quality || '1k';
-    const authResult = await ensureUserCanAfford(userId, quality);
-    if (!authResult.ok) {
-      sendJson(res, authResult.status, authResult.body);
-      return;
-    }
-
-    const postData = JSON.stringify(apiBody);
-    const targetUrl = new URL(endpoint);
-    const isHttps = targetUrl.protocol === 'https:';
-    const options = {
-      hostname: targetUrl.hostname,
-      port: targetUrl.port || (isHttps ? 443 : 80),
-      path: targetUrl.pathname + targetUrl.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(postData),
-      },
-      timeout: 3600000,
-      rejectUnauthorized: false,
-    };
-
-      let responded = false;
-      let responseStarted = false;
-
-      // 立即响应 200 OK，并设置分块传输
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store',
-        'Transfer-Encoding': 'chunked'
-      });
-      responseStarted = true;
-      
-      // 定期发送空白字符以保持连接活跃，防止 Zeabur 网关超时
-      const keepAliveInterval = setInterval(() => {
-        res.write(' ');
-      }, 15000);
-
-    const proxyReq = (isHttps ? https : http).request(options, (proxyRes) => {
-        proxyRes.on('data', (chunk) => {
-          res.write(chunk);
-        });
-      proxyRes.on('end', async () => {
-        if (responded) return;
-        responded = true;
-        clearInterval(keepAliveInterval);
-          try {
-            if (proxyRes.statusCode === 200) {
-              const updatedUser = await updateUserPoints(
-                authResult.user.id,
-                -authResult.cost,
-                'generate',
-                `普通生成(${quality})`
-              );
-              if (updatedUser) {
-                console.log(`[扣费] 用户 ${updatedUser.username} 扣除 ${authResult.cost} 积分，剩余 ${updatedUser.points}`);
-              }
-            } else {
-              console.error(`[代理] json 上游返回状态码: ${proxyRes.statusCode}`);
-            }
-          } catch (error) {
-            console.error('[扣费] 普通生成后更新积分失败:', error);
-          } finally {
-            res.end();
-        }
-        });
-
-        proxyRes.on('error', (err) => {
-          if (responded) return;
-          responded = true;
-          clearInterval(keepAliveInterval);
-          console.error('[代理] json 上游响应错误:', err);
-          res.write(JSON.stringify({ error: { message: `代理响应失败: ${err.message}` } }));
-          res.end();
-      });
-    });
-
-    proxyReq.on('error', (err) => {
-      if (responded) return;
-      responded = true;
-      clearInterval(keepAliveInterval);
-      res.write(JSON.stringify({ error: { message: `代理请求失败: ${err.message}` } }));
-      res.end();
-    });
-
-    proxyReq.on('timeout', () => {
-      if (responded) return;
-      responded = true;
-      clearInterval(keepAliveInterval);
-      proxyReq.destroy();
-      res.write(JSON.stringify({ error: { message: 'API请求超时（超过60分钟），可能模型拥堵，请稍后重试' } }));
-      res.end();
-    });
-
-    proxyReq.write(postData);
-    proxyReq.end();
+  sendJson(res, 200, {
+    success: true,
+    job: {
+      id: job.id,
+      status: job.status,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+      updatedAt: job.updatedAt,
+      errorMessage: job.errorMessage || '',
+      result: job.status === 'completed' ? job.result : null,
+    },
   });
+}
+
+async function cancelGenerationJob(req, res) {
+  const { jobId, userId } = await parseRequestBody(req);
+  const job = jobId ? generationJobs.get(jobId) : null;
+
+  if (!job) {
+    sendJson(res, 404, { error: '生成任务不存在或已过期' });
+    return;
+  }
+
+  if (userId && userId !== job.userId) {
+    sendJson(res, 403, { error: '无权取消该生成任务' });
+    return;
+  }
+
+  if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+    sendJson(res, 200, { success: true, status: job.status });
+    return;
+  }
+
+  job.cancelRequested = true;
+  job.status = 'cancelled';
+  job.updatedAt = Date.now();
+
+  if (job.activeRequest) {
+    job.activeRequest.destroy(new Error('GENERATION_CANCELLED'));
+  }
+
+  sendJson(res, 200, { success: true, status: 'cancelled' });
 }
 
 function parseRequestBody(req) {
@@ -662,7 +902,7 @@ function parseRequestBody(req) {
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Id, X-Quality');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -703,31 +943,51 @@ const server = http.createServer(async (req, res) => {
 
         const now = Date.now();
         const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
-        const ipRecord = await getOne('SELECT * FROM ip_registrations WHERE ip = ?', [clientIp]);
-        if (ipRecord && now - ipRecord.last_registered_at < oneMonthMs) {
+        const ipLastRegisteredAt = useJsonStore
+          ? parseInt(jsonIpRegistrations[clientIp] || 0, 10)
+          : ((await getOne('SELECT * FROM ip_registrations WHERE ip = ?', [clientIp])) || {}).last_registered_at;
+        if (ipLastRegisteredAt && now - ipLastRegisteredAt < oneMonthMs) {
           sendJson(res, 403, { error: '该IP本月已注册过账号，请勿频繁注册。' });
           return;
         }
 
         const newId = `uid_${now}`;
         const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-        await query(
-          `INSERT INTO users
-           (id, username, real_name, password_hash, points, registered_at, register_ip, open_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [newId, username, realName, passwordHash, 580, now, clientIp, null, now, now]
-        );
-        await query(
-          `INSERT INTO ip_registrations (ip, last_registered_at)
-           VALUES (?, ?)
-           ON DUPLICATE KEY UPDATE last_registered_at = VALUES(last_registered_at)`,
-          [clientIp, now]
-        );
-        await query(
-          `INSERT INTO point_logs (user_id, change_amount, balance_after, action, note, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [newId, 580, 580, 'register_bonus', '新用户注册赠送积分', now]
-        );
+        if (useJsonStore) {
+          jsonUsers[newId] = {
+            id: newId,
+            username,
+            real_name: realName,
+            password_hash: passwordHash,
+            points: 580,
+            registered_at: now,
+            register_ip: clientIp,
+            open_id: null,
+            created_at: now,
+            updated_at: now,
+          };
+          jsonIpRegistrations[clientIp] = now;
+          persistJsonUsers();
+          persistJsonIpRegistrations();
+        } else {
+          await query(
+            `INSERT INTO users
+             (id, username, real_name, password_hash, points, registered_at, register_ip, open_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [newId, username, realName, passwordHash, 580, now, clientIp, null, now, now]
+          );
+          await query(
+            `INSERT INTO ip_registrations (ip, last_registered_at)
+             VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE last_registered_at = VALUES(last_registered_at)`,
+            [clientIp, now]
+          );
+          await query(
+            `INSERT INTO point_logs (user_id, change_amount, balance_after, action, note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [newId, 580, 580, 'register_bonus', '新用户注册赠送积分', now]
+          );
+        }
         user = await getUserById(newId);
         isNew = true;
       } else {
@@ -797,7 +1057,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/users') {
-      const users = await query('SELECT * FROM users ORDER BY registered_at DESC');
+      const users = useJsonStore
+        ? Object.values(jsonUsers).sort((a, b) => b.registered_at - a.registered_at)
+        : await query('SELECT * FROM users ORDER BY registered_at DESC');
       sendJson(res, 200, { success: true, users: users.map(normalizeUser) });
       return;
     }
@@ -850,16 +1112,35 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: '删除失败，用户不存在' });
         return;
       }
-      await query('DELETE FROM users WHERE id = ?', [userId]);
-      if (user.register_ip) {
-        await query('DELETE FROM ip_registrations WHERE ip = ?', [user.register_ip]);
+      if (useJsonStore) {
+        delete jsonUsers[userId];
+        if (user.register_ip) {
+          delete jsonIpRegistrations[user.register_ip];
+        }
+        persistJsonUsers();
+        persistJsonIpRegistrations();
+      } else {
+        await query('DELETE FROM users WHERE id = ?', [userId]);
+        if (user.register_ip) {
+          await query('DELETE FROM ip_registrations WHERE ip = ?', [user.register_ip]);
+        }
       }
       sendJson(res, 200, { success: true });
       return;
     }
 
     if (req.method === 'POST' && pathname === '/api/generate') {
-      proxyRequest(req, res);
+      await createGenerationJob(req, res);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/generate/status') {
+      getGenerationJob(req, res, url);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/generate/cancel') {
+      await cancelGenerationJob(req, res);
       return;
     }
 

@@ -1661,10 +1661,76 @@ function setupDragDrop() {
 
 // ===================== IMAGE GENERATION =====================
 let currentAbortController = null;
+let currentGenerationJobId = null;
 
-function cancelGeneration() {
-  if (!STATE.isGenerating || !currentAbortController) return;
-  currentAbortController.abort();
+function updateGeneratingProgress(startTime, imageCount, sizeNote, extraText = '') {
+  const loadingProgress = document.getElementById('loadingProgress');
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  const min = Math.floor(elapsed / 60);
+  const sec = elapsed % 60;
+  const prefix = imageCount > 1 ? `生成 ${imageCount} 张 | ` : '';
+  const detail = extraText ? `<br>${extraText}` : '';
+  loadingProgress.innerHTML = `${prefix}${min}:${String(sec).padStart(2, '0')}${sizeNote}${detail}<br><button onclick="cancelGeneration()" class="loading-action-btn">停止生成 (不扣除积分)</button>`;
+}
+
+async function pollGenerationResult(jobId, startTime, imageCount, sizeNote) {
+  while (true) {
+    if (currentAbortController?.signal.aborted) {
+      throw new Error('已停止本次生成');
+    }
+
+    const resp = await fetch(`/api/generate/status?id=${encodeURIComponent(jobId)}&t=${Date.now()}`, {
+      headers: { 'X-User-Id': currentUser.id },
+      signal: currentAbortController.signal
+    });
+    const data = await resp.json();
+
+    if (!resp.ok || !data.success || !data.job) {
+      throw new Error(data.error || '读取生成状态失败');
+    }
+
+    const job = data.job;
+    const statusTextMap = {
+      queued: '任务已提交，等待开始...',
+      processing: '云端正在生成 2K/4K 图片，请耐心等待...',
+      completed: '生成完成，正在载入结果...',
+      failed: '生成失败',
+      cancelled: '生成已取消'
+    };
+    updateGeneratingProgress(startTime, imageCount, sizeNote, statusTextMap[job.status] || '处理中...');
+
+    if (job.status === 'completed') {
+      return job.result;
+    }
+    if (job.status === 'failed') {
+      throw new Error(job.errorMessage || '生成失败');
+    }
+    if (job.status === 'cancelled') {
+      throw new Error('已停止本次生成');
+    }
+
+    await sleep(3000);
+  }
+}
+
+async function cancelGeneration() {
+  if (!STATE.isGenerating) return;
+
+  if (currentGenerationJobId && currentUser) {
+    try {
+      await fetch('/api/generate/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: currentGenerationJobId, userId: currentUser.id })
+      });
+    } catch (error) {
+      console.warn('取消生成请求失败:', error);
+    }
+  }
+
+  if (currentAbortController) {
+    currentAbortController.abort();
+  }
   showToast('已停止本次生成', 'success');
 }
 
@@ -1709,8 +1775,6 @@ async function generateImages() {
     : '1024x1024';
   const quality = QUALITY_MAP[STATE.quality] || 'low';
 
-  // 判断是否通过本地代理（http:// 方式访问）
-  const isHttp = window.location.protocol === 'http:' || window.location.protocol === 'https:';
   const fetchUrl = '/api/generate';
 
   // 从提示词中提取生成数量（支持格式：[3]、3张、x3、×3，默认1张，最大9张）
@@ -1729,26 +1793,21 @@ async function generateImages() {
   showGeneratingState();
 
   const startTime = Date.now();
-  const sizeNote = STATE.quality === '4k' ? ' (4K可能需5-15分钟)' : '';
-  const loadingProgress = document.getElementById('loadingProgress');
-  loadingProgress.innerHTML = (imageCount > 1 ? `正在生成 ${imageCount} 张...` : '正在生成...') + sizeNote + `<br><button onclick="cancelGeneration()" class="loading-action-btn">停止生成 (不扣除积分)</button>`;
-
-  // 计时器
-  let timerInterval = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const min = Math.floor(elapsed / 60);
-    const sec = elapsed % 60;
-    loadingProgress.innerHTML = (imageCount > 1 ? `生成 ${imageCount} 张 | ` : '') + `${min}:${String(sec).padStart(2, '0')}` + sizeNote + `<br><button onclick="cancelGeneration()" class="loading-action-btn">停止生成 (不扣除积分)</button>`;
-  }, 1000);
+  const sizeNote = STATE.quality === '4k'
+    ? ' (4K可能需5-15分钟)'
+    : STATE.quality === '2k'
+      ? ' (2K可能需3-8分钟)'
+      : '';
+  updateGeneratingProgress(startTime, imageCount, sizeNote, '任务正在提交...');
 
   currentAbortController = new AbortController();
+  currentGenerationJobId = null;
 
   try {
     const hasRef = STATE.refImages.length > 0;
-    let resp, rawText;
+    let resp;
 
     if (hasRef) {
-      // 参考图模式：multipart，n参数控制数量
       const formData = new FormData();
       formData.append('model', model);
       formData.append('prompt', cleanPrompt);
@@ -1765,24 +1824,18 @@ async function generateImages() {
       headers['X-User-Id'] = currentUser.id;
       headers['X-Quality'] = STATE.quality;
       resp = await fetch(fetchUrl, { method: 'POST', headers, body: formData, signal: currentAbortController.signal });
-      rawText = await resp.text();
     } else {
-      // 无参考图：JSON，单次请求 n 张
       const body = { model, prompt: cleanPrompt, n: imageCount, size, quality };
       const headers = { 'Content-Type': 'application/json' };
       headers['X-User-Id'] = currentUser.id;
       headers['X-Quality'] = STATE.quality;
       resp = await fetch(fetchUrl, { method: 'POST', headers, body: JSON.stringify(body), signal: currentAbortController.signal });
-      rawText = await resp.text();
     }
 
+    const submitData = await resp.json();
     if (!resp.ok) {
-      let errMsg;
-      try { const d = JSON.parse(rawText); errMsg = d.error?.message || `HTTP ${resp.status}`; }
-      catch(e) { errMsg = rawText.substring(0, 200) || `HTTP ${resp.status}`; }
-      
+      const errMsg = submitData.error?.message || submitData.error || `HTTP ${resp.status}`;
       if (resp.status === 402) {
-        // 积分不足，弹出充值框
         showToast(errMsg, 'error');
         toggleUserMenu();
         return;
@@ -1790,21 +1843,18 @@ async function generateImages() {
       throw new Error(errMsg);
     }
 
-    // 解析响应（支持单张和多张返回）
-    const parsedImages = [];
-    try {
-      const data = JSON.parse(rawText);
-      if (data.data && Array.isArray(data.data)) {
-        data.data.forEach((item, i) => {
-          if (item.url || item.b64_json) {
-            parsedImages.push({ url: item.url || null, b64: item.b64_json || null, index: i });
-          }
-        });
-      }
-    } catch(e) {}
-    
-    // 生成成功，刷新用户积分
-    if (currentUser) {
+    currentGenerationJobId = submitData.jobId;
+    const result = await pollGenerationResult(currentGenerationJobId, startTime, imageCount, sizeNote);
+    const parsedImages = (result && Array.isArray(result.images)) ? result.images : [];
+    if (parsedImages.length === 0) {
+      throw new Error('API未返回图片');
+    }
+
+    if (result?.user) {
+      currentUser = result.user;
+      localStorage.setItem('cyberforge_user', JSON.stringify(currentUser));
+      updateUserUI();
+    } else if (currentUser) {
       fetch('/api/user?id=' + currentUser.id)
         .then(res => res.json())
         .then(uData => {
@@ -1816,43 +1866,7 @@ async function generateImages() {
         });
     }
 
-    // NDJSON / 流式响应解析
-    if (parsedImages.length === 0) {
-      const lines = rawText.trim().split('\n');
-      const partialParts = {}; // key by partial_image_index
-      for (const line of lines) {
-        try {
-          const obj = JSON.parse(line.trim());
-          if (obj.type === 'image_generation.completed' && obj.b64_json) {
-            parsedImages.push({ url: null, b64: obj.b64_json, index: parsedImages.length });
-          } else if (obj.type === 'image_generation.partial_image' && obj.b64_json) {
-            const idx = obj.partial_image_index || 0;
-            if (!partialParts[idx]) partialParts[idx] = [];
-            partialParts[idx].push(obj.b64_json);
-          } else if (obj.b64_json && !obj.type) {
-            parsedImages.push({ url: null, b64: obj.b64_json, index: parsedImages.length });
-          } else if (obj.data && Array.isArray(obj.data)) {
-            obj.data.forEach((item, i) => {
-              if (item.url || item.b64_json) {
-                parsedImages.push({ url: item.url || null, b64: item.b64_json || null, index: parsedImages.length });
-              }
-            });
-          }
-        } catch(e) {}
-      }
-      // 合并 partial 碎片
-      for (const idx of Object.keys(partialParts).sort((a,b) => a-b)) {
-        partialParts[idx].sort();
-        parsedImages.push({ url: null, b64: partialParts[idx].join(''), index: parseInt(idx) });
-      }
-    }
-
-    if (parsedImages.length === 0) {
-      throw new Error('API未返回图片');
-    }
-
-    // 存入 results
-    parsedImages.forEach((img, i) => {
+    parsedImages.forEach((img) => {
       STATE.results.push({
         index: STATE.results.length + 1,
         prompt: userPrompt,
@@ -1863,21 +1877,21 @@ async function generateImages() {
     });
 
     showToast(`成功生成 ${parsedImages.length} 张！`, 'success');
-    // 第一张显示在中间
     const first = parsedImages[0];
     const src = first.url || (first.b64 ? `data:image/png;base64,${first.b64}` : null);
     if (src) showInCenter(src, 0);
-    // 加入历史（所有）
     STATE.results.forEach(r => addToHistory(r));
 
   } catch (err) {
-    STATE.results.push({ index: STATE.results.length + 1, prompt: userPrompt, error: err.message });
-    showToast(err.message, 'error');
+    if (err.name !== 'AbortError') {
+      STATE.results.push({ index: STATE.results.length + 1, prompt: userPrompt, error: err.message });
+      showToast(err.message, 'error');
+    }
   }
 
-  // Hide loading
-  clearInterval(timerInterval);
   STATE.isGenerating = false;
+  currentAbortController = null;
+  currentGenerationJobId = null;
   document.getElementById('generateBtn').disabled = false;
   document.getElementById('centerGenerating').classList.add('hidden');
   document.getElementById('centerGenerating').style.display = 'none';

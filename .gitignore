@@ -2,6 +2,7 @@ node_modules/
 app.db
 users.json
 ip_records.json
+app_settings.json
 *.log
 .env
 .env.local
