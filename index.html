@@ -1226,10 +1226,10 @@ function adminDeleteUser(userId, username) {
 const DEFAULTS = {
   adminPassword: 'xxxb520',
   apiEndpoint: 'https://api.openai-hk.com/v1/images/generations',
-  apiKey: '',
   model: 'gpt-image-2',
   apiEnabled: false,
-  timerEnd: null
+  timerEnd: null,
+  apiConfigured: false
 };
 
 // ===================== SIZE MAPPING =====================
@@ -1400,29 +1400,34 @@ function loadSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem('cyberforge_admin') || '{}');
     if (saved.adminPassword) DEFAULTS.adminPassword = saved.adminPassword;
-    if (saved.apiEndpoint) DEFAULTS.apiEndpoint = saved.apiEndpoint;
-    if (saved.apiKey) DEFAULTS.apiKey = saved.apiKey;
-    if (saved.model) DEFAULTS.model = saved.model;
-    if (saved.apiEnabled !== undefined) DEFAULTS.apiEnabled = saved.apiEnabled;
-    if (saved.timerEnd) DEFAULTS.timerEnd = saved.timerEnd;
-
-    document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
-    document.getElementById('apiKeyInput').value = DEFAULTS.apiKey;
-    document.getElementById('modelSelect').value = DEFAULTS.model;
-    document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
-
-    updateApiWarning();
   } catch(e) { /* ignore */ }
+
+  fetch('/api/settings/public?t=' + Date.now())
+    .then(res => res.json())
+    .then(data => {
+      if (!data.success || !data.settings) return;
+      DEFAULTS.apiEndpoint = data.settings.apiEndpoint || DEFAULTS.apiEndpoint;
+      DEFAULTS.model = data.settings.model || DEFAULTS.model;
+      DEFAULTS.apiEnabled = data.settings.apiEnabled === true;
+      DEFAULTS.timerEnd = data.settings.timerEnd || null;
+      DEFAULTS.apiConfigured = data.settings.apiConfigured === true;
+
+      document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
+      document.getElementById('apiKeyInput').value = '';
+      document.getElementById('modelSelect').value = DEFAULTS.model;
+      document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
+
+      updateStatusIndicator();
+      updateTimerInfo();
+    })
+    .catch(() => {
+      updateStatusIndicator();
+    });
 }
 
 function saveSettingsToStorage() {
   const settings = {
-    adminPassword: DEFAULTS.adminPassword,
-    apiEndpoint: DEFAULTS.apiEndpoint,
-    apiKey: DEFAULTS.apiKey,
-    model: DEFAULTS.model,
-    apiEnabled: DEFAULTS.apiEnabled,
-    timerEnd: DEFAULTS.timerEnd
+    adminPassword: DEFAULTS.adminPassword
   };
   localStorage.setItem('cyberforge_admin', JSON.stringify(settings));
 }
@@ -1439,12 +1444,11 @@ function updateStatusIndicator() {
     DEFAULTS.apiEnabled = false;
     DEFAULTS.timerEnd = null;
     document.getElementById('apiEnabledToggle').checked = false;
-    saveSettingsToStorage();
     dot.className = 'status-dot offline';
     text.textContent = '定时已到期';
-  } else if (!DEFAULTS.apiKey) {
+  } else if (!DEFAULTS.apiConfigured) {
     dot.className = 'status-dot offline';
-    text.textContent = '未配置API密钥';
+    text.textContent = '管理员未配置API';
   } else {
     dot.className = 'status-dot online';
     text.textContent = '系统在线';
@@ -1458,7 +1462,7 @@ function updateApiWarning() {
   const corsNote = document.getElementById('corsNote');
   const proxyOk = document.getElementById('proxyOk');
 
-  if (!DEFAULTS.apiKey || !DEFAULTS.apiEnabled) {
+  if (!DEFAULTS.apiConfigured || !DEFAULTS.apiEnabled) {
     warning.style.display = 'block';
     info.style.display = 'none';
     corsNote.style.display = 'none';
@@ -1642,13 +1646,13 @@ async function generateImages() {
   if (STATE.isGenerating) return;
 
   if (!currentUser) {
-    showToast('请先点击右上角扫码登录！', 'error');
+    showToast('请先点击右上角登录！', 'error');
     toggleUserMenu();
     return;
   }
 
-  if (!DEFAULTS.apiKey) {
-    showToast('API密钥未配置，请联系管理员', 'error');
+  if (!DEFAULTS.apiConfigured) {
+    showToast('管理员尚未配置API，请联系管理员', 'error');
     return;
   }
 
@@ -1673,7 +1677,6 @@ async function generateImages() {
   }
 
   // Get API parameters
-  const apiKey = DEFAULTS.apiKey;
   const model = DEFAULTS.model;
   const size = (SIZE_MAP[model] && SIZE_MAP[model][STATE.ratio])
     ? SIZE_MAP[model][STATE.ratio][STATE.quality]
@@ -1682,7 +1685,7 @@ async function generateImages() {
 
   // 判断是否通过本地代理（http:// 方式访问）
   const isHttp = window.location.protocol === 'http:' || window.location.protocol === 'https:';
-  const fetchUrl = isHttp ? '/api/generate' : DEFAULTS.apiEndpoint;
+  const fetchUrl = '/api/generate';
 
   // 从提示词中提取生成数量（支持格式：[3]、3张、x3、×3，默认1张，最大9张）
   const getImageCount = (text) => {
@@ -1720,7 +1723,6 @@ async function generateImages() {
 
     if (hasRef) {
       // 参考图模式：multipart，n参数控制数量
-      const editEndpoint = DEFAULTS.apiEndpoint.replace(/\/generations\/?$/, '/edits');
       const formData = new FormData();
       formData.append('model', model);
       formData.append('prompt', cleanPrompt);
@@ -1734,27 +1736,16 @@ async function generateImages() {
       });
 
       const headers = {};
-      if (isHttp) {
-        headers['X-Api-Key'] = apiKey;
-        headers['X-Api-Endpoint'] = editEndpoint;
-        headers['X-User-Id'] = currentUser.id;
-        headers['X-Quality'] = STATE.quality;
-      } else {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-      }
+      headers['X-User-Id'] = currentUser.id;
+      headers['X-Quality'] = STATE.quality;
       resp = await fetch(fetchUrl, { method: 'POST', headers, body: formData, signal: currentAbortController.signal });
       rawText = await resp.text();
     } else {
       // 无参考图：JSON，单次请求 n 张
       const body = { model, prompt: cleanPrompt, n: imageCount, size, quality };
-      if (isHttp) { body.apiKey = apiKey; body.endpoint = DEFAULTS.apiEndpoint; }
       const headers = { 'Content-Type': 'application/json' };
-      if (isHttp) {
-        headers['X-User-Id'] = currentUser.id;
-        headers['X-Quality'] = STATE.quality;
-      } else {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-      }
+      headers['X-User-Id'] = currentUser.id;
+      headers['X-Quality'] = STATE.quality;
       resp = await fetch(fetchUrl, { method: 'POST', headers, body: JSON.stringify(body), signal: currentAbortController.signal });
       rawText = await resp.text();
     }
@@ -1910,7 +1901,7 @@ function openAdmin() {
 
   // Sync current state to UI
   document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
-  document.getElementById('apiKeyInput').value = DEFAULTS.apiKey;
+  document.getElementById('apiKeyInput').value = '';
   document.getElementById('modelSelect').value = DEFAULTS.model;
   document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
   updateTimerInfo();
@@ -1935,6 +1926,7 @@ function adminLogin() {
     document.getElementById('adminSettings').style.display = 'block';
     
     document.getElementById('adminLoginError').style.display = 'none';
+    loadAdminSettingsPanel();
   } else {
     document.getElementById('adminLoginError').style.display = 'block';
     document.getElementById('adminLoginError').textContent = '拒绝访问 — 密码错误';
@@ -1953,11 +1945,9 @@ function toggleApiEnabled() {
     DEFAULTS.apiEnabled = false;
     DEFAULTS.timerEnd = null;
     updateTimerInfo();
-    saveSettingsToStorage();
     updateStatusIndicator();
   } else {
     DEFAULTS.apiEnabled = true;
-    saveSettingsToStorage();
     updateStatusIndicator();
   }
 }
@@ -1976,7 +1966,6 @@ function setAutoOffTimer() {
   DEFAULTS.timerEnd = endTime.toISOString();
   DEFAULTS.apiEnabled = true;
   document.getElementById('apiEnabledToggle').checked = true;
-  saveSettingsToStorage();
   updateStatusIndicator();
   updateTimerInfo();
   scheduleAutoOff();
@@ -1993,7 +1982,6 @@ function checkAutoOffTimer() {
       DEFAULTS.apiEnabled = false;
       DEFAULTS.timerEnd = null;
       document.getElementById('apiEnabledToggle').checked = false;
-      saveSettingsToStorage();
       updateStatusIndicator();
       updateTimerInfo();
     } else {
@@ -2015,7 +2003,6 @@ function scheduleAutoOff() {
         DEFAULTS.apiEnabled = false;
         DEFAULTS.timerEnd = null;
         document.getElementById('apiEnabledToggle').checked = false;
-        saveSettingsToStorage();
         updateStatusIndicator();
         updateTimerInfo();
         showToast('API已被定时关闭', 'error');
@@ -2065,8 +2052,8 @@ function saveAdminSettings() {
   }
 
   DEFAULTS.apiEndpoint = endpoint;
-  DEFAULTS.apiKey = apiKey;
   DEFAULTS.model = model;
+  DEFAULTS.apiConfigured = !!apiKey;
 
   // 填了API密钥就自动开启开关
   if (apiKey) {
@@ -2083,9 +2070,35 @@ function saveAdminSettings() {
   }
 
   saveSettingsToStorage();
-  updateStatusIndicator();
-
-  showToast('设置保存成功', 'success');
+  fetch('/api/admin/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      apiEndpoint: DEFAULTS.apiEndpoint,
+      apiKey,
+      model: DEFAULTS.model,
+      apiEnabled: DEFAULTS.apiEnabled,
+      timerEnd: DEFAULTS.timerEnd
+    })
+  }).then(res => res.json())
+    .then(data => {
+      if (!data.success || !data.settings) {
+        showToast(data.error || '设置保存失败', 'error');
+        return;
+      }
+      DEFAULTS.apiEndpoint = data.settings.apiEndpoint || DEFAULTS.apiEndpoint;
+      DEFAULTS.model = data.settings.model || DEFAULTS.model;
+      DEFAULTS.apiEnabled = data.settings.apiEnabled === true;
+      DEFAULTS.timerEnd = data.settings.timerEnd || null;
+      DEFAULTS.apiConfigured = !!data.settings.apiKey;
+      document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
+      document.getElementById('apiKeyInput').value = '';
+      updateStatusIndicator();
+      updateTimerInfo();
+      showToast('设置保存成功，所有用户将共用管理员配置的API', 'success');
+    }).catch(() => {
+      showToast('设置保存失败，请重试', 'error');
+    });
 }
 
 function clearAllSettings() {
@@ -2095,24 +2108,58 @@ function clearAllSettings() {
   }
 
   openConfirmModal('确认清空所有设置（包括API密钥和密码）？', () => {
-    localStorage.removeItem('cyberforge_admin');
-    DEFAULTS.apiEndpoint = 'https://api.openai-hk.com/v1/images/generations';
-    DEFAULTS.apiKey = '';
-    DEFAULTS.model = 'gpt-image-2';
-    DEFAULTS.apiEnabled = false;
     DEFAULTS.adminPassword = 'xxxb520';
-    DEFAULTS.timerEnd = null;
-
-    document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
-    document.getElementById('apiKeyInput').value = '';
-    document.getElementById('modelSelect').value = 'dall-e-3';
-    document.getElementById('apiEnabledToggle').checked = false;
-    updateTimerInfo();
     saveSettingsToStorage();
-    updateStatusIndicator();
-
-    showToast('所有设置已恢复默认', 'success');
+    fetch('/api/admin/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        apiEndpoint: 'https://api.openai-hk.com/v1/images/generations',
+        apiKey: '',
+        model: 'gpt-image-2',
+        apiEnabled: false,
+        timerEnd: null
+      })
+    }).then(res => res.json())
+      .then(data => {
+        if (!data.success || !data.settings) {
+          showToast(data.error || '恢复默认失败', 'error');
+          return;
+        }
+        DEFAULTS.apiEndpoint = data.settings.apiEndpoint;
+        DEFAULTS.model = data.settings.model;
+        DEFAULTS.apiEnabled = data.settings.apiEnabled === true;
+        DEFAULTS.timerEnd = data.settings.timerEnd || null;
+        DEFAULTS.apiConfigured = !!data.settings.apiKey;
+        document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
+        document.getElementById('apiKeyInput').value = '';
+        document.getElementById('modelSelect').value = DEFAULTS.model;
+        document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
+        updateTimerInfo();
+        updateStatusIndicator();
+        showToast('所有设置已恢复默认', 'success');
+      }).catch(() => showToast('恢复默认失败，请重试', 'error'));
   });
+}
+
+function loadAdminSettingsPanel() {
+  fetch('/api/admin/settings?t=' + Date.now())
+    .then(res => res.json())
+    .then(data => {
+      if (!data.success || !data.settings) return;
+      DEFAULTS.apiEndpoint = data.settings.apiEndpoint || DEFAULTS.apiEndpoint;
+      DEFAULTS.model = data.settings.model || DEFAULTS.model;
+      DEFAULTS.apiEnabled = data.settings.apiEnabled === true;
+      DEFAULTS.timerEnd = data.settings.timerEnd || null;
+      DEFAULTS.apiConfigured = !!data.settings.apiKey;
+      document.getElementById('apiEndpoint').value = DEFAULTS.apiEndpoint;
+      document.getElementById('apiKeyInput').value = data.settings.apiKey || '';
+      document.getElementById('modelSelect').value = DEFAULTS.model;
+      document.getElementById('apiEnabledToggle').checked = DEFAULTS.apiEnabled;
+      updateTimerInfo();
+      updateStatusIndicator();
+    })
+    .catch(() => showToast('读取管理员设置失败', 'error'));
 }
 
 // ===================== UTILITIES =====================
