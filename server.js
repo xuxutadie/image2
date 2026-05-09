@@ -737,7 +737,9 @@ async function createGenerationJob(req, res) {
 
   const contentType = req.headers['content-type'] || '';
   const userId = req.headers['x-user-id'];
-  const requestedQuality = req.headers['x-quality'] || '1k';
+  const requestedQuality = QUALITY_COSTS[req.headers['x-quality']]
+    ? req.headers['x-quality']
+    : '1k';
   const settings = await getAppSettings();
 
   if (!settings.apiEnabled) {
@@ -773,7 +775,7 @@ async function createGenerationJob(req, res) {
       return;
     }
 
-    quality = params.quality || requestedQuality;
+    quality = QUALITY_COSTS[params.quality] ? params.quality : requestedQuality;
     headers = {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${settings.apiKey}`,
