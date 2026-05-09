@@ -942,14 +942,6 @@ const server = http.createServer(async (req, res) => {
         }
 
         const now = Date.now();
-        const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
-        const ipLastRegisteredAt = useJsonStore
-          ? parseInt(jsonIpRegistrations[clientIp] || 0, 10)
-          : ((await getOne('SELECT * FROM ip_registrations WHERE ip = ?', [clientIp])) || {}).last_registered_at;
-        if (ipLastRegisteredAt && now - ipLastRegisteredAt < oneMonthMs) {
-          sendJson(res, 403, { error: '该IP本月已注册过账号，请勿频繁注册。' });
-          return;
-        }
 
         const newId = `uid_${now}`;
         const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -1114,16 +1106,9 @@ const server = http.createServer(async (req, res) => {
       }
       if (useJsonStore) {
         delete jsonUsers[userId];
-        if (user.register_ip) {
-          delete jsonIpRegistrations[user.register_ip];
-        }
         persistJsonUsers();
-        persistJsonIpRegistrations();
       } else {
         await query('DELETE FROM users WHERE id = ?', [userId]);
-        if (user.register_ip) {
-          await query('DELETE FROM ip_registrations WHERE ip = ?', [user.register_ip]);
-        }
       }
       sendJson(res, 200, { success: true });
       return;
